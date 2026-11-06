@@ -3,13 +3,18 @@ package utils
 import (
 	"context"
 	"crypto/hmac"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"wppserver/pkg/http/model"
@@ -19,7 +24,47 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-var jwtKey = "your-256-bit-secret" // wppserver-rest-api
+var (
+	signingKeyOnce  sync.Once
+	signingKeyValue string
+)
+
+// signingKey is loaded lazily from AUTH_JWT_SECRET. It must be lazy because
+// .env is parsed in main(), after package-level initialisation. If the value
+// is missing (or still the example value), an ephemeral secret is generated
+// so the service never ships with a publicly known signing key.
+func signingKey() string {
+	signingKeyOnce.Do(func() {
+		key := strings.TrimSpace(os.Getenv("AUTH_JWT_SECRET"))
+		if key != "" && key != "change-this-to-any-random-text" {
+			signingKeyValue = key
+			return
+		}
+
+		log.Print("WARNING: AUTH_JWT_SECRET is not set (or is the example value). Generating an ephemeral secret; tokens will not survive a restart.")
+
+		buf := make([]byte, 32)
+		if _, err := cryptorand.Read(buf); err != nil {
+			log.Fatalf("could not generate JWT secret: %v", err)
+		}
+
+		signingKeyValue = base64.RawURLEncoding.EncodeToString(buf)
+	})
+
+	return signingKeyValue
+}
+
+func tokenTTL() time.Duration {
+	minutes := 60
+
+	if raw := strings.TrimSpace(os.Getenv("AUTH_TOKEN_TTL_MINUTES")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			minutes = parsed
+		}
+	}
+
+	return time.Duration(minutes) * time.Minute
+}
 
 func MakeRandomNumber(min int, max int) int {
 	rand.Seed(time.Now().UTC().UnixNano())
@@ -37,7 +82,7 @@ func MakeRandomString() string {
 }
 
 func MakeHMAC256(message string) string {
-	hmacSecret := []byte(jwtKey)
+	hmacSecret := []byte(signingKey())
 
 	h := hmac.New(sha256.New, hmacSecret)
 	h.Write([]byte(message))
@@ -60,10 +105,12 @@ func CheckPasswordHash(password, hash string) bool {
 }
 
 func ExtractClaims(tokenStr string) (jwt.MapClaims, bool) {
-	hmacSecret := []byte(jwtKey)
-
 	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-		return hmacSecret, nil
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+
+		return []byte(signingKey()), nil
 	})
 
 	if err != nil {
@@ -72,16 +119,14 @@ func ExtractClaims(tokenStr string) (jwt.MapClaims, bool) {
 
 	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
 		return claims, true
-	} else {
-		log.Printf("Invalid JWT Token")
-		return nil, false
 	}
+
+	log.Printf("Invalid JWT Token")
+	return nil, false
 }
 
 func MakeTokenFromUUID(uuid uuid.UUID) string {
-	hmacSecret := []byte(jwtKey)
-
-	expirationTime := time.Now().Add(60 * 15 * time.Second)
+	expirationTime := time.Now().Add(tokenTTL())
 
 	claims := &model.Claims{
 		ID: uuid,
@@ -91,7 +136,7 @@ func MakeTokenFromUUID(uuid uuid.UUID) string {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString(hmacSecret)
+	tokenString, err := token.SignedString([]byte(signingKey()))
 
 	if err != nil {
 		panic(err)
@@ -101,14 +146,12 @@ func MakeTokenFromUUID(uuid uuid.UUID) string {
 }
 
 func MakeToken(userId uuid.UUID, escope string, args ...uuid.UUID) string {
-	hmacSecret := []byte(jwtKey)
-
 	apiKeyId := uuid.Nil
 	if len(args) != 0 {
 		apiKeyId = args[0]
 	}
 
-	expirationTime := time.Now().Add(60 * 15 * time.Second)
+	expirationTime := time.Now().Add(tokenTTL())
 	claims := model.Claims{
 		ApiKeyId: apiKeyId,
 		UserId:   userId,
@@ -119,7 +162,7 @@ func MakeToken(userId uuid.UUID, escope string, args ...uuid.UUID) string {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString(hmacSecret)
+	tokenString, err := token.SignedString([]byte(signingKey()))
 
 	if err != nil {
 		log.Panic(err)
@@ -129,17 +172,19 @@ func MakeToken(userId uuid.UUID, escope string, args ...uuid.UUID) string {
 }
 
 func GetRequestAuth(db *sql.DB, r *http.Request) (model.Auth, bool) {
-	err := r.ParseForm()
-	if err != nil {
-		log.Fatal(err)
+	auth := model.Auth{}
+
+	if err := r.ParseForm(); err != nil {
+		log.Printf("could not parse request form: %v", err)
+		return auth, false
 	}
 
-	auth := model.Auth{}
 	reqToken := r.Header.Get("Authorization")
 	splitToken := strings.Split(reqToken, "Bearer ")
 	if len(splitToken) > 1 {
 		reqToken = splitToken[1]
 	}
+
 	userAuthorization, okGetUserFromClaims := GetUserFromClaims(reqToken, db)
 	if !okGetUserFromClaims {
 		return auth, false
@@ -163,7 +208,12 @@ func GetUserFromClaims(reqToken string, db *sql.DB) (model.User, bool) {
 		return user, false
 	}
 
-	userUUID, errUUID := uuid.Parse(claims["userid"].(string))
+	rawUserID, ok := claims["userid"].(string)
+	if !ok {
+		return user, false
+	}
+
+	userUUID, errUUID := uuid.Parse(rawUserID)
 	if errUUID != nil {
 		return user, false
 	}
@@ -187,7 +237,12 @@ func GetScopeFromClaims(reqToken string, db *sql.DB) (model.Scope, bool) {
 		return scope, false
 	}
 
-	scope.List = strings.Split(claims["Scope"].(string), " ")
+	rawScope, ok := claims["Scope"].(string)
+	if !ok {
+		return scope, false
+	}
+
+	scope.List = strings.Split(rawScope, " ")
 
 	return scope, true
 }
@@ -197,9 +252,9 @@ func GetRequestToken(db *sql.DB, r *http.Request) (string, bool) {
 	var scope string
 	var token string
 
-	err := r.ParseForm()
-	if err != nil {
-		log.Fatal(err)
+	if err := r.ParseForm(); err != nil {
+		log.Printf("could not parse request form: %v", err)
+		return "", false
 	}
 
 	ctx := context.Background()
@@ -210,7 +265,7 @@ func GetRequestToken(db *sql.DB, r *http.Request) (string, bool) {
 		clientId := r.Form.Get("client_id")
 		clientSecret := r.Form.Get("client_secret")
 
-		err = db.QueryRowContext(ctx, "SELECT id, userid, scope FROM wppserver_apikeys WHERE clientid=$1 AND clientsecret=$2 AND status='enabled'", clientId, MakeHMAC256(clientSecret)).Scan(
+		err := db.QueryRowContext(ctx, "SELECT userid, scope FROM wppserver_apikeys WHERE clientid=$1 AND clientsecret=$2 AND status='enabled'", clientId, MakeHMAC256(clientSecret)).Scan(
 			&userId, &scope)
 
 		if err != nil {
@@ -226,7 +281,7 @@ func GetRequestToken(db *sql.DB, r *http.Request) (string, bool) {
 		username := r.Form.Get("username")
 		password := r.Form.Get("password")
 
-		err = db.QueryRowContext(ctx, "SELECT id, password, type FROM wppserver_users WHERE email=$1 AND status='enabled'", username).Scan(
+		err := db.QueryRowContext(ctx, "SELECT id, password, type FROM wppserver_users WHERE email=$1 AND status='enabled'", username).Scan(
 			&user.Id, &user.Password, &user.Type)
 
 		if err != nil {

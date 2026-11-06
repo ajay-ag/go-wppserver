@@ -1,4 +1,7 @@
+.env
 /bin/*
 /dbdata
 /debug.log
 /wppserver
+*.log
+.DS_Store

@@ -5,9 +5,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
-	"wppserver/assets"
 	"wppserver/pkg/config"
 	"wppserver/pkg/http/model"
 	"wppserver/pkg/utils"
@@ -21,7 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-//App has router and db instances
+// App has router and db instances
 type App struct {
 	DB      *sql.DB
 	Router  *mux.Router
@@ -38,7 +38,13 @@ func (a *App) Initialize(config *config.Config) error {
 	}
 
 	a.Config = config
-	a.Devices = whatsapp.NewDevices()
+
+	devices, err := whatsapp.NewDevices()
+	if err != nil {
+		return err
+	}
+
+	a.Devices = devices
 	a.connectDevices()
 	a.Router = mux.NewRouter()
 	a.setRouters()
@@ -52,21 +58,17 @@ func (a *App) Initialize(config *config.Config) error {
 
 // Initial database settings
 func (a *App) DatabaseSetup(config *config.Config) (*sql.DB, error) {
-	// Create sqlite default db
-	if config.DB.DbURI == "file:dbdata/wppserver.db" {
+	// Create the sqlite data directory. The whatsmeow store creates its own
+	// tables on first run; the legacy dbdata.zip seed is no longer required.
+	if strings.HasPrefix(config.DB.DbURI, "file:dbdata/") {
 		path, err := utils.GetWorkDir()
 		if err != nil {
 			return nil, err
 		}
 		log.Printf("Work dir %v", path)
-		if _, err := os.Stat(path + "/dbdata/wppserver.db"); err != nil {
-			zipFile, errDir := assets.F.ReadFile("dbdata.zip")
-			if errDir != nil {
-				return nil, errDir
-			}
-			if errUnzip := utils.UnzipReader(zipFile, path); errUnzip != nil {
-				return nil, errUnzip
-			}
+
+		if err := os.MkdirAll(path+"/dbdata", 0o755); err != nil {
+			return nil, err
 		}
 	}
 
@@ -83,7 +85,7 @@ func (a *App) DatabaseSetup(config *config.Config) (*sql.DB, error) {
 	// Create initial tables in db
 	for _, v := range []string{
 		"CREATE TABLE IF NOT EXISTS wppserver_users( id VARCHAR(36) NOT NULL, name	TEXT, email	TEXT, type	TEXT, password	TEXT, status	TEXT DEFAULT 'disabled', PRIMARY KEY(id) );",
-		"CREATE TABLE IF NOT EXISTS wppserver_apikeys( id VARCHAR(36) NOT NULL, userid VARCHAR(36) NOT NULL, description TEXT, permissions TEXT, consumerkey TEXT, consumersecret TEXT, truncatedsecret	TEXT, scope	TEXT, status TEXT DEFAULT 'enabled', jid TEXT, PRIMARY KEY(id) );",
+		"CREATE TABLE IF NOT EXISTS wppserver_apikeys( id VARCHAR(36) NOT NULL, userid VARCHAR(36) NOT NULL, description TEXT, permissions TEXT, clientid TEXT, clientsecret TEXT, truncatedsecret	TEXT, scope	TEXT, status TEXT DEFAULT 'enabled', jid TEXT, PRIMARY KEY(id) );",
 		"CREATE TABLE IF NOT EXISTS wppserver_devices( id VARCHAR(36) NOT NULL, userid VARCHAR(36), jid	TEXT, qrcode	TEXT, connected	TEXT, PRIMARY KEY(id) );",
 		"CREATE TABLE IF NOT EXISTS wppserver_webhooks( id VARCHAR(36) NOT NULL, deviceid VARCHAR(36), description	TEXT, status	TEXT, url	TEXT, events	TEXT, secret	TEXT, PRIMARY KEY(id) );",
 	} {
@@ -127,18 +129,12 @@ func (a *App) DatabaseSetup(config *config.Config) (*sql.DB, error) {
 
 // Connect devices saved in DB
 func (a *App) connectDevices() {
-
-	if _, err := http.Get("http://clients3.google.com/generate_204"); err != nil {
-		log.Printf("No internet connection found. Restarting after 10 seconds")
-		time.Sleep(10 * time.Second)
-		a.connectDevices()
-		return
-	}
-
 	log.Printf("Init connection to Whatsapp")
+
 	rows, err := a.DB.Query("SELECT id, userid, jid, connected FROM wppserver_devices WHERE connected='yes'")
 	if err != nil {
-		log.Fatalf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
+		return
 	}
 	defer rows.Close()
 
@@ -146,42 +142,48 @@ func (a *App) connectDevices() {
 		var device whatsapp.Device
 
 		if err := rows.Scan(&device.Id, &device.UserId, &device.Jid, &device.Connected); err != nil {
-			log.Fatalf("rows error: %v\n", err)
+			log.Printf("rows error: %v\n", err)
+			continue
 		}
 
-		if _, ok := a.Devices.Get(device.UserId); !ok {
-			log.Printf("Connect to Whatsapp on startup:  %v\n", device.Jid)
+		if _, ok := a.Devices.Get(device.UserId); ok {
+			continue
+		}
 
-			device.FnUpdateDevice = func(d *whatsapp.Device) {
-				utils.DBUpdateDevice(a.DB, d)
-			}
+		log.Printf("Connect to Whatsapp on startup:  %v\n", device.Jid)
 
-			device.FnEvent = a.webhook
-			device.StartClient(a.Devices.Container)
+		device.FnUpdateDevice = func(d *whatsapp.Device) {
+			utils.DBUpdateDevice(a.DB, d)
+		}
 
-			err := device.Client.Connect()
-			if err != nil {
-				log.Panic(err)
-			}
+		device.FnEvent = a.webhook
+		if device.StartClient(a.Devices.Container) == nil {
+			log.Printf("Skipping device %s: could not start WhatsApp client\n", device.Id)
+			continue
+		}
 
-			if device.Client.Store.ID != nil {
-				a.Devices.Add(&device)
-			} else {
-				a.Devices.Remove(device.UserId)
-				utils.DBDeleteDevice(a.DB, &device)
-			}
+		if err := device.Client.Connect(); err != nil {
+			log.Printf("Could not reconnect device %s: %v\n", device.Id, err)
+			continue
+		}
+
+		if device.Client.Store.ID != nil {
+			a.Devices.Add(&device)
+		} else {
+			a.Devices.Remove(device.UserId)
+			utils.DBDeleteDevice(a.DB, &device)
 		}
 	}
 
-	err = rows.Err()
-	if err != nil {
-		log.Fatalf("query error: %v\n", err)
+	if err := rows.Err(); err != nil {
+		log.Printf("query error: %v\n", err)
 	}
 }
 
 // Set all required routers
 func (a *App) setRouters() {
 	a.Docs("/docs")
+	a.Get("/healthz", a.health)
 
 	a.Post("/v1/auth", a.accessToken)
 	a.Get("/v1/auth/refresh", a.refreshToken)
@@ -216,8 +218,18 @@ func (a *App) setRouters() {
 	a.Post("/v1/chat/send/image", a.sendImage)
 	a.Post("/v1/chat/send/document", a.sendDocument)
 
-	a.Post("/v1/phone/scraping", a.scrapingPhones)
-	a.Get("/v1/phone/contacts", a.getContacts)
+	// Contact scraping is intentionally disabled: this service only sends
+	// receipt messages and should not expose address-book data.
+	// a.Post("/v1/phone/scraping", a.scrapingPhones)
+	// a.Get("/v1/phone/contacts", a.getContacts)
+}
+
+// Health is intentionally unauthenticated so Docker/systemd can probe the
+// process without exposing session details.
+func (a *App) health(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
 // Show application docs

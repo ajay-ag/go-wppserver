@@ -32,7 +32,9 @@ func GetAllUsers(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var user model.User
 		if err := rows.Scan(&user.Id, &user.Name, &user.Email, &user.Type, &user.Status); err != nil {
-			log.Fatal(err)
+			log.Printf("error: %v\n", err)
+			respondError(w, http.StatusInternalServerError, "Could not read users")
+			return
 		}
 		users = append(users, user)
 	}
@@ -59,7 +61,9 @@ func FindUsers(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var user model.User
 		if err := rows.Scan(&user.Id, &user.Name, &user.Email, &user.Type, &user.Status); err != nil {
-			log.Fatal(err)
+			log.Printf("error: %v\n", err)
+			respondError(w, http.StatusInternalServerError, "Could not read users")
+			return
 		}
 		users = append(users, user)
 	}
@@ -67,6 +71,14 @@ func FindUsers(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 }
 
 func RegisterUser(db *sql.DB, w http.ResponseWriter, r *http.Request, config *config.Config) {
+	if !config.SETTINGS.AllowRegistration {
+		auth, ok := utils.GetRequestAuth(db, r)
+		if !ok || !auth.User.IsAdmin() {
+			respondError(w, http.StatusForbidden, "User registration is disabled")
+			return
+		}
+	}
+
 	user := model.User{Status: "disabled"}
 
 	decoder := json.NewDecoder(r.Body)
@@ -78,14 +90,24 @@ func RegisterUser(db *sql.DB, w http.ResponseWriter, r *http.Request, config *co
 
 	stmt, err := db.Prepare("INSERT INTO wppserver_users(id, name, email, password, type, status) VALUES($1,$2,$3,$4,$5,$6);")
 	if err != nil {
-		log.Panic(err)
+		log.Printf("error: %v\n", err)
+		respondError(w, http.StatusInternalServerError, "Could not prepare user insert")
+		return
+	}
+	defer stmt.Close()
+
+	userID, err := uuid.NewUUID()
+	if err != nil {
+		log.Printf("error: %v\n", err)
+		respondError(w, http.StatusInternalServerError, "Could not create user id")
+		return
 	}
 
-	uuid, err := uuid.NewUUID()
 	userPassword, err := utils.HashPassword(user.Password)
-
 	if err != nil {
-		log.Panic(err)
+		log.Printf("error: %v\n", err)
+		respondError(w, http.StatusInternalServerError, "Could not hash password")
+		return
 	}
 
 	if config.SETTINGS.NewUsersStatus == "ENABLED" {
@@ -94,17 +116,18 @@ func RegisterUser(db *sql.DB, w http.ResponseWriter, r *http.Request, config *co
 		user.Status = "disabled"
 	}
 
-	result, err := stmt.Exec(uuid, user.Name, user.Email, userPassword, "agent", user.Status)
-	if err != nil && result != nil {
-		log.Panic(err)
+	if _, err := stmt.Exec(userID, user.Name, user.Email, userPassword, "agent", user.Status); err != nil {
+		log.Printf("error: %v\n", err)
+		respondError(w, http.StatusInternalServerError, "Could not create user")
+		return
 	}
 
-	err = db.QueryRow("SELECT id, name, email, type, status FROM wppserver_users WHERE id=$1", uuid).Scan(
+	err = db.QueryRow("SELECT id, name, email, type, status FROM wppserver_users WHERE id=$1", userID).Scan(
 		&user.Id, &user.Name, &user.Email, &user.Type, &user.Status)
 
-	if err != nil || err == sql.ErrNoRows {
+	if err != nil {
 		log.Printf("query error: %v\n", err)
-		respondError(w, http.StatusBadRequest, err.Error())
+		respondError(w, http.StatusInternalServerError, "Could not read created user")
 		return
 	}
 
@@ -169,25 +192,22 @@ func UpdateUser(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
 
 	rows, err := result.RowsAffected()
 	if err != nil {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusBadRequest, "No rows affected")
 		return
 	}
 
 	if rows != 1 {
-		log.Fatalf("expected to affect 1 row, affected %d", rows)
-		if err != nil {
-			log.Panicf("query error: %v\n", err)
-			respondError(w, http.StatusBadRequest, "Expected to affect no more than 1 a row")
-			return
-		}
+		log.Printf("expected to affect 1 row, affected %d", rows)
+		respondError(w, http.StatusNotFound, "User not found")
+		return
 	}
 
 	log.Printf("User updated %q\n", userTarget.Email)
@@ -212,19 +232,20 @@ func DeleteUser(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	result, err := db.ExecContext(ctx, "DELETE FROM wppserver_users WHERE id=$1;", userTarget.Id)
 	if err != nil {
-		log.Fatalf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
+		respondError(w, http.StatusInternalServerError, "Could not delete user")
+		return
 	}
 
 	rows, err := result.RowsAffected()
 	if err != nil {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusBadRequest, "No rows affected")
 		return
 	}
 
 	if rows != 1 {
-		log.Panicf("query error: %v\n", err)
-		respondError(w, http.StatusBadRequest, "Expected to affect no more than 1 a row")
+		respondError(w, http.StatusNotFound, "User not found")
 		return
 	}
 
@@ -253,19 +274,19 @@ func StatusUser(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	result, err = db.ExecContext(ctx, "UPDATE wppserver_users SET status=$1 WHERE id=$2;", userTarget.Status, userTarget.Id)
 	if err != nil {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
 
 	rows, err := result.RowsAffected()
 	if err != nil {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusBadRequest, "No rows affected")
 		return
 	}
 	if rows != 1 {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusBadRequest, "Expected to affect no more than 1 a row")
 		return
 	}
@@ -304,7 +325,7 @@ func PasswordUser(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		&user.Id, &user.Name, &user.Email, &user.Password)
 
 	if err != nil {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusBadRequest, "No rows affected")
 		return
 	}
@@ -317,21 +338,21 @@ func PasswordUser(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 
 	newPassword, err := utils.HashPassword(userPassword.NewPassword)
 	if err != nil {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
 
 	result, err = db.ExecContext(ctx, "UPDATE wppserver_users SET password=$1 WHERE id=$2;", newPassword, userPassword.Id)
 	if err != nil {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
 
 	rows, err := result.RowsAffected()
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("error: %v\n", err)
 		respondError(w, http.StatusBadRequest, "No rows affected")
 		return
 	}
@@ -365,14 +386,14 @@ func CreateUserKey(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 
 	stmt, err := db.Prepare("INSERT INTO wppserver_apikeys(id, userid, description, clientid, clientsecret, truncatedsecret) VALUES($1,$2,$3,$4,$5,$6);")
 	if err != nil {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
 
 	uuid, err := uuid.NewUUID()
 	if err != nil {
-		log.Panic(err)
+		log.Printf("error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
@@ -383,10 +404,9 @@ func CreateUserKey(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	keyData.ClientSecret = "cs_" + utils.MakeRandomString() // Return the unhashed key on creation to be displayed once and never stored.
 	keyData.TruncatedSecret = keyData.ClientSecret[0:14]    // first clientsecret characters
 
-	res, err := stmt.Exec(uuid, keyData.UserId, keyData.Description, keyData.ClientID, utils.MakeHMAC256(keyData.ClientSecret), keyData.TruncatedSecret)
-	if err != nil && res != nil {
-		log.Panic(err)
-		respondError(w, http.StatusInternalServerError, "")
+	if _, err := stmt.Exec(uuid, keyData.UserId, keyData.Description, keyData.ClientID, utils.MakeHMAC256(keyData.ClientSecret), keyData.TruncatedSecret); err != nil {
+		log.Printf("error: %v\n", err)
+		respondError(w, http.StatusInternalServerError, "Could not create key")
 		return
 	}
 
@@ -412,12 +432,17 @@ func DeleteUserKey(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	result, err := db.ExecContext(ctx, "DELETE FROM wppserver_apikeys WHERE id=$1 AND userid=$2;", keyData.Id, keyData.UserId)
 	if err != nil {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
 
 	rows, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("query error: %v\n", err)
+		respondError(w, http.StatusInternalServerError, "Could not delete key")
+		return
+	}
 	if rows == 0 {
 		respondError(w, http.StatusConflict, "Target not found")
 		return
@@ -445,7 +470,7 @@ func GetUserKeys(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	rows, err := db.QueryContext(ctx, "SELECT id, userid, description, clientid, truncatedsecret FROM wppserver_apikeys WHERE userid=$1", userTarget.Id)
 	if err != nil {
-		log.Panicf("query error: %v\n", err)
+		log.Printf("query error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
@@ -454,7 +479,9 @@ func GetUserKeys(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var keyData model.Key
 		if err := rows.Scan(&keyData.Id, &keyData.UserId, &keyData.Description, &keyData.ClientID, &keyData.TruncatedSecret); err != nil {
-			log.Fatal(err)
+			log.Printf("error: %v\n", err)
+			respondError(w, http.StatusInternalServerError, "Could not read keys")
+			return
 		}
 		keys = append(keys, keyData)
 	}

@@ -3,6 +3,7 @@ package config
 import (
 	"log"
 	"os"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -23,7 +24,7 @@ type DataBase struct {
 	Password string `name:"dbpassword" description:"Set the database password."`
 	Name     string `name:"dbname" description:"Set the database name."`
 	Dialect  string `name:"dbdialect" description:"Set the database dialect." default:"sqlite"`
-	DbURI    string `name:"dburi" description:"Set the database local uri." default:"file:dbdata/wppserver.db?_foreign_keys=on"`
+	DbURI    string `name:"dburi" description:"Set the database local uri." default:"file:dbdata/wppserver.db?_pragma=foreign_keys(1)"`
 }
 
 type Server struct {
@@ -46,7 +47,16 @@ type License struct {
 }
 
 type Settings struct {
-	NewUsersStatus string
+	NewUsersStatus    string
+	AllowRegistration bool
+}
+
+func envOr(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+
+	return fallback
 }
 
 func GetConfig(input ...string) *Config {
@@ -57,18 +67,21 @@ func GetConfig(input ...string) *Config {
 		}
 	}
 
+	address := envOr("SERVER_ADDRESS", "127.0.0.1")
+	port := envOr("SERVER_PORT", "8786")
+
 	return &Config{
 		DB: DataBase{
 			Host:     os.Getenv("DATABASE_HOST"),
 			Port:     os.Getenv("DATABASE_PORT"),
 			Name:     os.Getenv("DATABASE_NAME"),
-			Dialect:  os.Getenv("DATABASE_TYPE"),
-			DbURI:    os.Getenv("DATABASE_URI"),
+			Dialect:  envOr("DATABASE_TYPE", "sqlite"),
+			DbURI:    envOr("DATABASE_URI", "file:dbdata/wppserver.db?_pragma=foreign_keys(1)"),
 			User:     os.Getenv("DATABASE_USER"),
 			Password: os.Getenv("DATABASE_PASSWORD"),
 		},
 		SERVER: Server{
-			Host: os.Getenv("SERVER_ADDRESS") + ":" + os.Getenv("SERVER_PORT"),
+			Host: address + ":" + port,
 		},
 		TLS: Certificate{
 			CertFile: os.Getenv("CERTIFICATE_FILE"),
@@ -80,7 +93,8 @@ func GetConfig(input ...string) *Config {
 			SecretKey:    os.Getenv("AUTH_JWT_SECRET"),
 		},
 		SETTINGS: Settings{
-			NewUsersStatus: os.Getenv("NEW_USERS_STATUS"),
+			NewUsersStatus:    envOr("NEW_USERS_STATUS", "DISABLED"),
+			AllowRegistration: strings.EqualFold(os.Getenv("ALLOW_USER_REGISTRATION"), "true"),
 		},
 		LICENSE: License{
 			Key: os.Getenv("LICENSE_KEY"),

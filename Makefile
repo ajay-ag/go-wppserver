@@ -1,19 +1,27 @@
 BINARY_NAME=wppserver
+GO ?= go
+LDFLAGS ?= -s -w
+
+.PHONY: build test vet docker compile
+
+build:
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o bin/$(BINARY_NAME) ./cmd
+
+test:
+	$(GO) test ./...
+
+vet:
+	$(GO) vet ./...
+
+docker:
+	docker build -t $(BINARY_NAME):local .
 
 compile:
 	echo "Compiling for every OS and Platform"
-	#GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-windows-386.exe cmd/main.go
-	GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-windows-amd64.exe cmd/main.go
-	GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-darwin-amd64 cmd/main.go
-	GOOS=linux GOARCH=386 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-linux-386 cmd/main.go
-	GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-linux-amd64 cmd/main.go
-	GOOS=linux GOARCH=arm go build -ldflags="-s -w" -o bin/${BINARY_NAME}-linux-arm cmd/main.go
-	GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-linux-arm64 cmd/main.go
-	#GOOS=linux GOARCH=riscv go build -ldflags="-s -w" -o bin/${BINARY_NAME}-linux-riscv cmd/main.go
-	GOOS=linux GOARCH=riscv64 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-linux-riscv64 cmd/main.go
-	GOOS=freebsd GOARCH=arm64 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-freebsd-arm64 cmd/main.go
-	GOOS=freebsd GOARCH=amd64 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-freebsd-amd64 cmd/main.go
-	#GOOS=freebsd GOARCH=riscv64 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-freebsd-riscv64 cmd/main.go
-	GOOS=openbsd GOARCH=arm64 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-openbsd-arm64 cmd/main.go
-	GOOS=openbsd GOARCH=amd64 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-openbsd-amd64 cmd/main.go
-	#GOOS=openbsd GOARCH=riscv64 go build -ldflags="-s -w" -o bin/${BINARY_NAME}-openbsd-riscv64 cmd/main.go
+	GOOS=windows GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o bin/${BINARY_NAME}-windows-amd64.exe ./cmd
+	GOOS=darwin GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o bin/${BINARY_NAME}-darwin-amd64 ./cmd
+	GOOS=darwin GOARCH=arm64 $(GO) build -ldflags="$(LDFLAGS)" -o bin/${BINARY_NAME}-darwin-arm64 ./cmd
+	GOOS=linux GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o bin/${BINARY_NAME}-linux-amd64 ./cmd
+	GOOS=linux GOARCH=arm64 $(GO) build -ldflags="$(LDFLAGS)" -o bin/${BINARY_NAME}-linux-arm64 ./cmd
+	GOOS=freebsd GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o bin/${BINARY_NAME}-freebsd-amd64 ./cmd
+	GOOS=openbsd GOARCH=amd64 $(GO) build -ldflags="$(LDFLAGS)" -o bin/${BINARY_NAME}-openbsd-amd64 ./cmd

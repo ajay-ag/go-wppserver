@@ -10,7 +10,7 @@ var spec =
   },
   "externalDocs": {
     "description": "Find out more about",
-    "url": "http://localhost:3000/docs/index.html"
+    "url": "http://localhost:8786/docs/index.html"
   },
   "security": [
     {
@@ -734,7 +734,7 @@ var spec =
     }
   },
   "swagger": "2.0",
-  "host": "localhost:3000",
+  "host": "localhost:8786",
   "tags": [
     {
       "name": "Auth",
@@ -770,7 +770,7 @@ var spec =
     "oauth2": {
       "type": "oauth2",
       "flow": "password",
-      "tokenUrl": "http://localhost:3000/v1/auth",
+      "tokenUrl": "http://localhost:8786/v1/auth",
       "scopes": {}
     }
   },

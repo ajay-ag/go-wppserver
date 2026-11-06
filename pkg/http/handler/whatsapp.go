@@ -23,6 +23,17 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// requireDevice keeps handlers safe when the session store failed to open or
+// WhatsApp disconnected and the in-memory client is nil.
+func requireDevice(device *whatsapp.Device, w http.ResponseWriter) bool {
+	if device == nil || device.Client == nil {
+		respondError(w, http.StatusServiceUnavailable, "WhatsApp session is not available")
+		return false
+	}
+
+	return true
+}
+
 // Gets QR code encoded in Base64
 func LoginDevice(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *http.Request) {
 	var device *whatsapp.Device
@@ -37,11 +48,12 @@ func LoginDevice(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 	if !ok {
 		// deviceId, err := uuid.NewUUID()
 		// if err != nil {
-		// 	log.Panic(err)
+		// 	log.Printf("error: %v\n", err)
 		// }
 		device, ok = ds.RegisterNew(auth.User.Id)
 		if !ok {
-			log.Panic("Device create error")
+			respondError(w, http.StatusInternalServerError, "Could not create WhatsApp device")
+			return
 		}
 
 		device.FnUpdateDevice = func(d *whatsapp.Device) {
@@ -50,19 +62,26 @@ func LoginDevice(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 
 		stmt, err := db.Prepare("INSERT INTO wppserver_devices(id, userid, jid, Connected) VALUES($1,$2,$3,$4);")
 		if err != nil {
-			log.Panicf("query error: %v\n", err)
+			log.Printf("query error: %v\n", err)
 			respondError(w, http.StatusInternalServerError, "")
 			return
 		}
 
 		result, err := stmt.Exec(device.Id, device.UserId, "", "yes")
 		if err != nil && result != nil {
-			log.Panicf("query error: %v\n", err)
+			log.Printf("query error: %v\n", err)
 			respondError(w, http.StatusBadRequest, "No rows affected")
 			return
 		}
 
-		device.StartClient(ds.Container)
+		if device.StartClient(ds.Container) == nil {
+			respondError(w, http.StatusServiceUnavailable, "Could not start WhatsApp client")
+			return
+		}
+	}
+
+	if !requireDevice(device, w) {
+		return
 	}
 
 	if device.Client.Store.ID == nil {
@@ -73,14 +92,17 @@ func LoginDevice(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 		if err != nil {
 			// This error means that we're already logged in, so ignore it.
 			if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
-				log.Panicf("Failed to get QR channel: %v\n", err)
-				respondError(w, http.StatusInternalServerError, "")
+				log.Printf("Failed to get QR channel: %v\n", err)
+				respondError(w, http.StatusInternalServerError, "Could not create QR channel")
 				return
 			}
+
+			respondJSON(w, http.StatusNoContent, nil)
+			return
 		} else {
 			err = device.Client.Connect()
 			if err != nil {
-				log.Panic(err)
+				log.Printf("error: %v\n", err)
 				respondError(w, http.StatusInternalServerError, "Failed to connect client")
 				return
 			}
@@ -94,6 +116,11 @@ func LoginDevice(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 					break
 				}
 			}
+			if device.QrCode.Base64QrCode == "" {
+				respondError(w, http.StatusBadGateway, "WhatsApp did not return a QR code")
+				return
+			}
+
 			respondJSON(w, http.StatusOK, device.QrCode)
 			return
 		}
@@ -101,7 +128,7 @@ func LoginDevice(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 		if !device.Client.IsConnected() {
 			err := device.Client.Connect()
 			if err != nil {
-				log.Panic(err)
+				log.Printf("error: %v\n", err)
 				respondError(w, http.StatusInternalServerError, "Failed to connect client")
 				return
 			}
@@ -126,14 +153,19 @@ func LogoutDevice(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *ht
 	if !ok {
 		respondError(w, http.StatusInternalServerError, "No session")
 		return
-	} else if device.Client.IsLoggedIn() {
+	}
+	if !requireDevice(device, w) {
+		return
+	}
+
+	if device.Client.IsLoggedIn() {
 		if !device.Client.IsConnected() {
 			device.Client.Connect()
 		}
 
-		err := device.Client.Logout()
+		err := device.Client.Logout(context.Background())
 		if err != nil {
-			log.Panicf("Could not perform logout: %v\n", err)
+			log.Printf("Could not perform logout: %v\n", err)
 			respondError(w, http.StatusInternalServerError, "Could not perform logout")
 			return
 		}
@@ -146,6 +178,8 @@ func LogoutDevice(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *ht
 		respondJSON(w, http.StatusNoContent, nil)
 		return
 	}
+
+	respondError(w, http.StatusBadRequest, "Device is not logged in")
 }
 
 // Status from Device websocket
@@ -161,6 +195,9 @@ func Status(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *http.Req
 	device, ok = ds.Get(auth.User.Id)
 	if !ok {
 		respondError(w, http.StatusInternalServerError, "No session")
+		return
+	}
+	if !requireDevice(device, w) {
 		return
 	}
 
@@ -193,8 +230,14 @@ func Connect(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *http.Re
 		respondError(w, http.StatusInternalServerError, "No session")
 		return
 	}
+	if !requireDevice(device, w) {
+		return
+	}
 
 	device.Client = device.StartClient(ds.Container)
+	if !requireDevice(device, w) {
+		return
+	}
 
 	if device.Client.Store.ID == nil {
 		respondError(w, http.StatusInternalServerError, "No logged")
@@ -203,7 +246,7 @@ func Connect(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *http.Re
 
 	err := device.Client.Connect()
 	if err != nil {
-		log.Panic(err)
+		log.Printf("error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "Failed to Connect")
 		return
 	}
@@ -226,6 +269,9 @@ func Disconnect(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *http
 	device, ok = ds.Get(auth.User.Id)
 	if !ok {
 		respondError(w, http.StatusInternalServerError, "No session")
+		return
+	}
+	if !requireDevice(device, w) {
 		return
 	}
 
@@ -251,6 +297,9 @@ func SendText(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *http.R
 		respondError(w, http.StatusInternalServerError, "No session")
 		return
 	}
+	if !requireDevice(device, w) {
+		return
+	}
 
 	message := model.Message{}
 	decoder := json.NewDecoder(r.Body)
@@ -272,6 +321,10 @@ func SendText(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *http.R
 
 	message.Id = whatsmeow.GenerateMessageID()
 	recipient, ok := device.ParseJID(message.Phone)
+	if !ok {
+		respondError(w, http.StatusBadRequest, "Invalid phone number")
+		return
+	}
 
 	msg := &waProto.Message{
 		ExtendedTextMessage: &waProto.ExtendedTextMessage{
@@ -279,9 +332,9 @@ func SendText(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *http.R
 		},
 	}
 
-	if message.ContextInfo.StanzaId != nil {
+	if message.ContextInfo.StanzaID != nil {
 		msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{
-			StanzaId:      proto.String(*message.ContextInfo.StanzaId),
+			StanzaID:      proto.String(*message.ContextInfo.StanzaID),
 			Participant:   proto.String(*message.ContextInfo.Participant),
 			QuotedMessage: &waProto.Message{Conversation: proto.String("")},
 		}
@@ -289,8 +342,8 @@ func SendText(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *http.R
 
 	result, err := device.Client.SendMessage(context.Background(), recipient, msg)
 	if err != nil {
-		log.Panicf("Send message: %v\n", err)
-		respondError(w, http.StatusInternalServerError, err.Error())
+		log.Printf("Send message: %v\n", err)
+		respondError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
@@ -317,6 +370,9 @@ func SendImage(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *http.
 	device, ok = ds.Get(auth.User.Id)
 	if !ok {
 		respondError(w, http.StatusInternalServerError, "No session")
+		return
+	}
+	if !requireDevice(device, w) {
 		return
 	}
 
@@ -346,37 +402,41 @@ func SendImage(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *http.
 
 	mediaType := strings.ToLower(dataURL.MediaType.ContentType())
 	if mediaType != "image/png" && mediaType != "image/jpg" && mediaType != "image/jpeg" && mediaType != "image/webp" {
-		log.Panicf("Send image: %v\n", err)
+		log.Printf("Send image: %v\n", err)
 		respondError(w, http.StatusBadRequest, "Unsupported image format. Only use JPG, JPEG, PNG, WEBP Images")
 		return
 	}
 
 	uploaded, err := device.Client.Upload(context.Background(), dataURL.Data, whatsmeow.MediaImage)
 	if err != nil {
-		log.Panic(err)
+		log.Printf("error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "Failed to upload file")
 		return
 	}
 
 	message.Id = whatsmeow.GenerateMessageID()
 	recipient, ok := device.ParseJID(message.Phone)
+	if !ok {
+		respondError(w, http.StatusBadRequest, "Invalid phone number")
+		return
+	}
 
 	msg := &waProto.Message{
 		ImageMessage: &waProto.ImageMessage{
 			Caption:       proto.String(message.Caption),
-			Url:           proto.String(uploaded.URL),
+			URL:           proto.String(uploaded.URL),
 			DirectPath:    proto.String(uploaded.DirectPath),
 			MediaKey:      uploaded.MediaKey,
 			Mimetype:      proto.String(http.DetectContentType(dataURL.Data)),
-			FileEncSha256: uploaded.FileEncSHA256,
-			FileSha256:    uploaded.FileSHA256,
+			FileEncSHA256: uploaded.FileEncSHA256,
+			FileSHA256:    uploaded.FileSHA256,
 			FileLength:    proto.Uint64(uint64(len(dataURL.Data))),
 		},
 	}
 
-	if message.ContextInfo.StanzaId != nil {
+	if message.ContextInfo.StanzaID != nil {
 		msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{
-			StanzaId:      proto.String(*message.ContextInfo.StanzaId),
+			StanzaID:      proto.String(*message.ContextInfo.StanzaID),
 			Participant:   proto.String(*message.ContextInfo.Participant),
 			QuotedMessage: &waProto.Message{Conversation: proto.String("")},
 		}
@@ -413,6 +473,9 @@ func SendDocument(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *ht
 		respondError(w, http.StatusInternalServerError, "No session")
 		return
 	}
+	if !requireDevice(device, w) {
+		return
+	}
 
 	message := model.Message{}
 	decoder := json.NewDecoder(r.Body)
@@ -445,37 +508,41 @@ func SendDocument(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *ht
 
 	mediaType := strings.ToLower(dataURL.MediaType.ContentType())
 	if mediaType != "application/pdf" && mediaType != "application/docx" && mediaType != "application/xlsx" && mediaType != "application/pptx" && mediaType != "application/doc" && mediaType != "application/xls" && mediaType != "application/ppt" && mediaType != "application/txt" && mediaType != "application/docm" && mediaType != "application/xlsm" && mediaType != "application/pptm" && mediaType != "application/rtf" && mediaType != "application/csv" && mediaType != "application/tsv" && mediaType != "application/zip" && mediaType != "application/x-rar-compressed" && mediaType != "application/octet-stream" {
-		log.Panicf("Send document: %v\n", err)
+		log.Printf("Send document: %v\n", err)
 		respondError(w, http.StatusBadRequest, "Unsupported image format. Only use JPG, JPEG, PNG, WEBP Images")
 		return
 	}
 
 	uploaded, err := device.Client.Upload(context.Background(), dataURL.Data, whatsmeow.MediaDocument)
 	if err != nil {
-		log.Panic(err)
+		log.Printf("error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "Failed to upload file")
 		return
 	}
 
 	message.Id = whatsmeow.GenerateMessageID()
 	recipient, ok := device.ParseJID(message.Phone)
+	if !ok {
+		respondError(w, http.StatusBadRequest, "Invalid phone number")
+		return
+	}
 
 	msg := &waProto.Message{
 		DocumentMessage: &waProto.DocumentMessage{
 			FileName:      &message.FileName,
-			Url:           proto.String(uploaded.URL),
+			URL:           proto.String(uploaded.URL),
 			DirectPath:    proto.String(uploaded.DirectPath),
 			MediaKey:      uploaded.MediaKey,
 			Mimetype:      proto.String(http.DetectContentType(dataURL.Data)),
-			FileEncSha256: uploaded.FileEncSHA256,
-			FileSha256:    uploaded.FileSHA256,
+			FileEncSHA256: uploaded.FileEncSHA256,
+			FileSHA256:    uploaded.FileSHA256,
 			FileLength:    proto.Uint64(uint64(len(dataURL.Data))),
 		},
 	}
 
-	if message.ContextInfo.StanzaId != nil {
+	if message.ContextInfo.StanzaID != nil {
 		msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{
-			StanzaId:      proto.String(*message.ContextInfo.StanzaId),
+			StanzaID:      proto.String(*message.ContextInfo.StanzaID),
 			Participant:   proto.String(*message.ContextInfo.Participant),
 			QuotedMessage: &waProto.Message{Conversation: proto.String("")},
 		}
@@ -512,6 +579,9 @@ func ScrapingPhones(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *
 		respondError(w, http.StatusInternalServerError, "No session")
 		return
 	}
+	if !requireDevice(device, w) {
+		return
+	}
 
 	type checkPhones struct {
 		Phones []string
@@ -526,7 +596,13 @@ func ScrapingPhones(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *
 
 	// get all contacts to compare
 	allContacts := make(map[string]types.ContactInfo)
-	checkContacts, err := device.Client.Store.Contacts.GetAllContacts()
+	checkContacts, err := device.Client.Store.Contacts.GetAllContacts(context.Background())
+	if err != nil {
+		log.Printf("error: %v\n", err)
+		respondError(w, http.StatusInternalServerError, "")
+		return
+	}
+
 	for cjid, cdata := range checkContacts {
 		cphoneNumber := strings.Split(cjid.String(), "@")[0]
 		cphoneNumber = strings.Split(cphoneNumber, ".")[0]
@@ -538,7 +614,7 @@ func ScrapingPhones(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *
 		}
 	}
 
-	isOnWhatsapp, err := device.Client.IsOnWhatsApp(phones.Phones)
+	isOnWhatsapp, err := device.Client.IsOnWhatsApp(context.Background(), phones.Phones)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "")
 		return
@@ -560,9 +636,9 @@ func ScrapingPhones(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *
 	}
 
 	// get profile info
-	infoPhones, err := device.Client.GetUserInfo(jids)
+	infoPhones, err := device.Client.GetUserInfo(context.Background(), jids)
 	if err != nil {
-		log.Panic(err)
+		log.Printf("error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
@@ -593,7 +669,7 @@ func ScrapingPhones(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *
 			}
 		}
 
-		picture, err := device.Client.GetProfilePictureInfo(jid, nil)
+		picture, err := device.Client.GetProfilePictureInfo(context.Background(), jid, nil)
 		if err == nil {
 			finfo.PictureURL = picture.URL
 		}
@@ -620,10 +696,13 @@ func GetContacts(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 		respondError(w, http.StatusInternalServerError, "No session")
 		return
 	}
+	if !requireDevice(device, w) {
+		return
+	}
 
-	result, err := device.Client.Store.Contacts.GetAllContacts()
+	result, err := device.Client.Store.Contacts.GetAllContacts(context.Background())
 	if err != nil {
-		log.Panic(err)
+		log.Printf("error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
@@ -647,7 +726,7 @@ func GetContacts(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 			IsContact:    true,
 		}
 
-		picture, err := device.Client.GetProfilePictureInfo(cjid, nil)
+		picture, err := device.Client.GetProfilePictureInfo(context.Background(), cjid, nil)
 		if err == nil {
 			cinfo.PictureURL = picture.URL
 		}
@@ -657,7 +736,7 @@ func GetContacts(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 	}
 
 	// check is on whatsapp
-	isOnWhatsapp, err := device.Client.IsOnWhatsApp(checkPhones)
+	isOnWhatsapp, err := device.Client.IsOnWhatsApp(context.Background(), checkPhones)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "")
 		return
@@ -698,6 +777,9 @@ func CreateWebhook(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *h
 		respondError(w, http.StatusInternalServerError, "No session")
 		return
 	}
+	if !requireDevice(device, w) {
+		return
+	}
 
 	webhook := model.WebHook{}
 	decoder := json.NewDecoder(r.Body)
@@ -713,12 +795,12 @@ func CreateWebhook(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *h
 
 	stmt, err := db.Prepare("INSERT INTO wppserver_webhooks(id, userid, deviceid, description, url, secret, status) VALUES($1,$2,$3,$4,$5,$6,$7);")
 	if err != nil {
-		log.Panicf("query prepare error: %v\n", err)
+		log.Printf("query prepare error: %v\n", err)
 	}
 
 	webhook.Id, err = uuid.NewUUID()
 	if err != nil {
-		log.Panicf("generate uuid error: %v\n", err)
+		log.Printf("generate uuid error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
@@ -728,7 +810,7 @@ func CreateWebhook(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *h
 
 	res, err := stmt.Exec(webhook.Id, webhook.UserId, webhook.DeviceId, webhook.Description, webhook.URL, webhook.Secrete, "enabled")
 	if err != nil && res != nil {
-		log.Panicf("query exec error: %v\n", err)
+		log.Printf("query exec error: %v\n", err)
 	}
 
 	log.Printf("Key registed %q\n", webhook.Id)
@@ -750,6 +832,9 @@ func DeleteWebhook(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *h
 		respondError(w, http.StatusInternalServerError, "No session")
 		return
 	}
+	if !requireDevice(device, w) {
+		return
+	}
 
 	webhook := model.WebHook{}
 	decoder := json.NewDecoder(r.Body)
@@ -761,7 +846,7 @@ func DeleteWebhook(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *h
 	ctx := context.Background()
 	result, err := db.ExecContext(ctx, "DELETE FROM wppserver_webhooks WHERE id=$1 AND userid=$2;", webhook.Id, device.UserId)
 	if err != nil {
-		log.Panicf("query exec error: %v\n", err)
+		log.Printf("query exec error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
@@ -791,6 +876,9 @@ func GetWebhooks(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 		respondError(w, http.StatusInternalServerError, "No session")
 		return
 	}
+	if !requireDevice(device, w) {
+		return
+	}
 
 	webhook := model.WebHook{}
 	decoder := json.NewDecoder(r.Body)
@@ -802,7 +890,7 @@ func GetWebhooks(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 	ctx := context.Background()
 	rows, err := db.QueryContext(ctx, "SELECT id, userid, deviceid, description, url, secret, status FROM wppserver_webhooks WHERE userid=$1", device.UserId)
 	if err != nil {
-		log.Panicf("query select error: %v\n", err)
+		log.Printf("query select error: %v\n", err)
 		respondError(w, http.StatusInternalServerError, "")
 		return
 	}
@@ -811,7 +899,7 @@ func GetWebhooks(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 	for rows.Next() {
 		var webhooksData model.WebHook
 		if err := rows.Scan(&webhooksData.Id, &webhooksData.UserId, &webhooksData.DeviceId, &webhooksData.Description, &webhooksData.URL, &webhooksData.Secrete, &webhooksData.Status); err != nil {
-			log.Panic(err)
+			log.Printf("error: %v\n", err)
 			respondError(w, http.StatusInternalServerError, "")
 			return
 		}
@@ -825,14 +913,14 @@ func GetWebhooks(db *sql.DB, ds *whatsapp.Devices, w http.ResponseWriter, r *htt
 func Webhook(db *sql.DB, device *whatsapp.Device, rawEvt interface{}) {
 	rows, err := db.Query("SELECT id, userid, deviceid, description, url, secret, status FROM wppserver_webhooks WHERE userid=$1", device.UserId)
 	if err != nil {
-		log.Panicf("query select error: %v\n", err)
+		log.Printf("query select error: %v\n", err)
 		return
 	}
 
 	for rows.Next() {
 		var webhooksData model.WebHook
 		if err := rows.Scan(&webhooksData.Id, &webhooksData.UserId, &webhooksData.DeviceId, &webhooksData.Description, &webhooksData.URL, &webhooksData.Secrete, &webhooksData.Status); err != nil {
-			log.Panic(err)
+			log.Printf("error: %v\n", err)
 			return
 		}
 		if webhooksData.Status != "enabled" {
