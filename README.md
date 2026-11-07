@@ -28,19 +28,61 @@ must not run in production.
 - WhatsApp protocol logging defaults to `INFO`; `DEBUG` is opt-in.
 - Contact scraping and contact-list endpoints are no longer routed.
 - `/healthz` endpoint for Docker/systemd health checks.
+- Explicit data directory via `-data-dir` / `WPP_DATA_DIR`, so the binary can
+  live in a read-only location while `.env`, `dbdata/` and `debug.log` stay in
+  a writable state directory.
 - Dockerfile updated, non-root runtime, persistent `dbdata` volume.
 - `go.mod` requires Go 1.26+.
 
 ## Requirements
 
-- Go 1.26+ (or Docker)
+- Go 1.26+ (build only — the release binary needs nothing installed)
 - A spare phone number with WhatsApp
-- A persistent disk for `dbdata/` (WhatsApp session credentials live there)
+- A persistent disk for the data directory (WhatsApp session credentials live in
+  `dbdata/`)
+
+## Releases
+
+Tagged builds are published as static binaries (no libc, no Go toolchain
+required):
+
+```bash
+curl -fsSLO https://github.com/ajay-ag/go-wppserver/releases/latest/download/wppserver-linux-amd64
+curl -fsSLO https://github.com/ajay-ag/go-wppserver/releases/latest/download/SHA256SUMS
+
+shasum -a 256 -c SHA256SUMS --ignore-missing
+chmod +x wppserver-linux-amd64
+```
+
+Available targets: `linux-amd64`, `linux-arm64`, `darwin-amd64`,
+`darwin-arm64`. On macOS, remove the quarantine flag after downloading:
+
+```bash
+xattr -d com.apple.quarantine wppserver-darwin-arm64
+```
+
+## Layout
+
+The binary and its state are separate:
+
+```
+/opt/rms-wppserver/wppserver              # read-only release artifact
+/etc/rms-wppserver/env                    # secrets (root:rms-wpp 0640)
+/var/lib/rms-wppserver/.env               # optional, if not using EnvironmentFile
+/var/lib/rms-wppserver/dbdata/            # WhatsApp session (0700, back this up)
+/var/lib/rms-wppserver/debug.log          # 0600
+```
+
+`-data-dir` (or `WPP_DATA_DIR`) selects the state directory. It defaults to the
+binary directory, which is convenient for a self-contained folder but wrong for
+`vendor/bin` or `/opt`. Relative paths inside the data dir (`dbdata/`, `docs/`
+excluded) resolve against it.
 
 ## Quick start
 
 ```bash
-cp .env.example .env
+mkdir -p /var/lib/rms-wppserver
+cp .env.example /var/lib/rms-wppserver/.env
 ```
 
 Edit `.env`:
@@ -56,10 +98,20 @@ AUTH_JWT_SECRET=<openssl rand -base64 48>
 Run:
 
 ```bash
-go run ./cmd -mode=run
-# or
+# From the repo (data dir must be explicit, otherwise state lands in the
+# temporary build dir that `go run` creates)
+go run ./cmd -mode=run -data-dir="$PWD"
+
+# Or build a release binary and run it from anywhere
 make build
-./bin/wppserver -mode=run
+./bin/wppserver -mode=run -data-dir=/var/lib/rms-wppserver
+```
+
+Startup logs print the resolved data dir and env file:
+
+```
+main.go:116: Data dir: /var/lib/rms-wppserver
+main.go:117: Env file: /var/lib/rms-wppserver/.env
 ```
 
 Pair the number once:
@@ -130,6 +182,44 @@ The `-p 127.0.0.1:...` form keeps the port off the public interface.
 
 If Laravel runs in another container, put both on a private Docker network and
 set `SERVER_ADDRESS=0.0.0.0`; do **not** publish the port to the internet.
+
+## systemd
+
+```ini
+[Unit]
+Description=RMS WhatsApp sender
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rms-wpp
+Group=rms-wpp
+WorkingDirectory=/var/lib/rms-wppserver
+ExecStart=/opt/rms-wppserver/wppserver -mode=run -data-dir=/var/lib/rms-wppserver
+EnvironmentFile=/etc/rms-wppserver/env
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/rms-wppserver
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`EnvironmentFile` is read before privileges are dropped, so
+`/etc/rms-wppserver/env` can be `root:root 0600`. Run exactly one instance per
+data directory: SQLite will report `database is locked` otherwise.
 
 ## Laravel integration
 

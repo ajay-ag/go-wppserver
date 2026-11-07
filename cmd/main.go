@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"wppserver/internal/app"
@@ -14,6 +15,7 @@ import (
 )
 
 var envfile *string
+var dataDir *string
 
 type program struct {
 	startTime time.Time
@@ -31,14 +33,6 @@ func (p *program) Start(s service.Service) error {
 
 func (p *program) run(args ...string) error {
 	app := &app.App{}
-	if *envfile == "" {
-		// Get .env file in root dir
-		path, err := utils.GetWorkDir()
-		if err != nil {
-			log.Fatal(err)
-		}
-		*envfile = path + "/.env"
-	}
 
 	if err := app.Initialize(config.GetConfig(*envfile)); err != nil {
 		log.Fatal(err)
@@ -54,32 +48,60 @@ func (p *program) Stop(s service.Service) error {
 }
 
 func main() {
-	path, err := utils.GetWorkDir()
+	// The binary can live in a read-only package directory (vendor/bin,
+	// /opt/...), so its own directory is only a default for the data dir.
+	exeDir, err := utils.GetWorkDir()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err = os.Chdir(path); err != nil {
+
+	mode := flag.String("mode", "run", "Run server or configure background service manager. Valid actions: ['run', 'start', 'stop', 'restart', 'install', 'uninstall']")
+	debug := flag.String("debug", "disabled", "Enable file debug output mode. Valid actions: ['enabled', 'disabled']")
+	envfile = flag.String("envfile", "", "Load an .env file for this process. Accepts an absolute path with the file name. Defaults to <data-dir>/.env.")
+	dataDir = flag.String("data-dir", os.Getenv("WPP_DATA_DIR"), "Directory for .env, dbdata/ and debug.log. Also read from WPP_DATA_DIR. Defaults to the binary directory.")
+	flag.Parse()
+
+	// Resolve the data dir before touching the filesystem: flag, then
+	// WPP_DATA_DIR, then next to the binary.
+	resolved := *dataDir
+	if resolved == "" {
+		resolved = exeDir
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err = os.MkdirAll(resolved, 0o755); err != nil {
+		log.Fatal(err)
+	}
+	*dataDir = resolved
+
+	if err = os.Chdir(*dataDir); err != nil {
 		log.Fatal(err)
 	}
 
 	log.SetFlags(log.Lshortfile | log.LstdFlags)
-	logFile, err := os.OpenFile(path+"/debug.log", os.O_APPEND|os.O_RDWR|os.O_CREATE, 0644)
+	logFile, err := os.OpenFile(filepath.Join(*dataDir, "debug.log"), os.O_APPEND|os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer logFile.Close()
 
-	mode := flag.String("mode", "run", "Run server or configure background service manager. Valid actions: ['run', 'start', 'stop', 'restart', 'install', 'uninstall']")
-	debug := flag.String("debug", "disabled", "Enable file debug output mode. Valid actions: ['enabled', 'disabled']")
-	envfile = flag.String("envfile", "", "Load an .env file for this process. Accepts an absolute path with the file name.")
-	flag.Parse()
+	if *envfile == "" {
+		*envfile = filepath.Join(*dataDir, ".env")
+	}
 
+	// The service manager starts the process from an arbitrary directory, so
+	// both the data dir and the env file must be passed as absolute paths.
 	svConfig := &service.Config{
 		Name:        "wppserver",
-		DisplayName: "Wppserver Service v1.0.0",
-		Description: "Wppserver API Server v1.0.0",
+		DisplayName: "Wppserver Service",
+		Description: "Wppserver API Server",
 		Arguments: []string{
-			"-debug=enabled", "-envfile=" + *envfile},
+			"-debug=enabled",
+			"-data-dir=" + *dataDir,
+			"-envfile=" + *envfile,
+		},
 	}
 
 	prg := &program{}
@@ -90,6 +112,9 @@ func main() {
 	if *debug == "enabled" {
 		log.SetOutput(logFile)
 	}
+
+	log.Printf("Data dir: %v", *dataDir)
+	log.Printf("Env file: %v", *envfile)
 
 	switch *mode {
 	case "run":

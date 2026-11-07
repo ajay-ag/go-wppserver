@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -61,13 +62,16 @@ func (a *App) DatabaseSetup(config *config.Config) (*sql.DB, error) {
 	// Create the sqlite data directory. The whatsmeow store creates its own
 	// tables on first run; the legacy dbdata.zip seed is no longer required.
 	if strings.HasPrefix(config.DB.DbURI, "file:dbdata/") {
-		path, err := utils.GetWorkDir()
+		// The process is chdir'ed into its data dir at startup, so a relative
+		// sqlite URI always lands inside that directory regardless of where
+		// the binary itself lives.
+		path, err := os.Getwd()
 		if err != nil {
 			return nil, err
 		}
 		log.Printf("Work dir %v", path)
 
-		if err := os.MkdirAll(path+"/dbdata", 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(path, "dbdata"), 0o755); err != nil {
 			return nil, err
 		}
 	}
@@ -234,7 +238,14 @@ func (a *App) health(w http.ResponseWriter, r *http.Request) {
 
 // Show application docs
 func (a *App) Docs(path string) {
-	a.Router.PathPrefix(path).Handler(http.StripPrefix(path, http.FileServer(http.Dir("./docs/"))))
+	// Swagger files ship next to the binary, not in the data dir.
+	root, err := utils.GetWorkDir()
+	if err != nil {
+		log.Printf("Docs disabled: %v", err)
+		return
+	}
+
+	a.Router.PathPrefix(path).Handler(http.StripPrefix(path, http.FileServer(http.Dir(filepath.Join(root, "docs")))))
 }
 
 // Wrap the router for GET method
